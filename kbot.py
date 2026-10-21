@@ -25,7 +25,7 @@ RAW_FIRST_CLASS_NAME_2 = os.environ.get("FIRST_CLASS_NAME_2", "").strip()
 SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
 SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "RefBot").strip() or "RefBot"
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-pro").strip() or "gemini-1.5-pro"
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
