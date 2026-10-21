@@ -4,14 +4,13 @@ import os
 import random
 import re
 import time
-from groq import AsyncGroq
+from google import genai
 from playwright.async_api import async_playwright, Page
 
 # 1. Load environment variables first
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
 
-# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
 pin_match = re.search(r"pin=(\d+)", raw_pin_input)
 if pin_match:
     KAHOOT_PIN = pin_match.group(1)
@@ -25,129 +24,108 @@ RAW_FIRST_CLASS_NAME_2 = os.environ.get("FIRST_CLASS_NAME_2", "").strip()
 SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
 SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "Ref").strip() or "Ref"
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "gemini-2.5-flash"
 
-if not GROQ_API_KEY:
-    raise ValueError("Missing GROQ_API_KEY environment variable. Set it in GitHub Secrets.")
+if not GEMINI_API_KEY:
+    raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+# Initialize the official Google GenAI client
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def build_bot_roster():
-    """Builds the list of 1st-class and 2nd-class bots based on workflow inputs."""
     roster = [{"name": FIRST_CLASS_NAME_1, "tier": 1}]
-
     if FIRST_CLASS_COUNT == 2:
         name_2 = RAW_FIRST_CLASS_NAME_2 if RAW_FIRST_CLASS_NAME_2 else "[default]"
         roster.append({"name": name_2, "tier": 1})
-
     for i in range(1, SECOND_CLASS_COUNT + 1):
         bot_name = f"{SECOND_CLASS_BASE_NAME}{i}" if SECOND_CLASS_COUNT > 1 else SECOND_CLASS_BASE_NAME
         roster.append({"name": bot_name, "tier": 2})
-
     return roster
 
 
 # ---------------------------------------------------------------------------
-# Ultra-Compact Groq Solvers (< 160 total tokens per call)
+# Gemini Solvers (Google GenAI SDK)
 # ---------------------------------------------------------------------------
 
-async def solve_mcq(question: str, options: list[str]) -> int:
-    """Quiz / True-False / Poll: returns single best index."""
-    opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(options))
-    try:
-        res = await groq_client.chat.completions.create(
+async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int = 50) -> str:
+    """Helper wrapper for Gemini synchronous model generation executed in an async loop."""
+    def _generate():
+        config = {
+            "temperature": 0.0,
+            "max_output_tokens": max_tokens,
+        }
+        if system_instruction:
+            config["system_instruction"] = system_instruction
+            
+        response = ai_client.models.generate_content(
             model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "Reply ONLY with the correct option digit (0-3)."},
-                {"role": "user", "content": f"Q: {question[:180]}\n{opts}"},
-            ],
-            temperature=0.0,
-            max_tokens=3,
+            contents=prompt,
+            config=config
         )
-        m = re.search(r"[0-3]", res.choices[0].message.content)
+        return response.text or ""
+
+    # Run blocking SDK call in an executor loop to prevent blocking async tasks
+    return await asyncio.to_thread(_generate)
+
+
+async def solve_mcq(question: str, options: list[str]) -> int:
+    opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(options))
+    prompt = f"Q: {question[:180]}\n{opts}\nReply ONLY with the correct option digit (0-3)."
+    try:
+        reply = await call_gemini(prompt, system_instruction="You are a precise quiz solver.", max_tokens=5)
+        m = re.search(r"[0-3]", reply)
         if m and int(m.group(0)) < len(options):
             return int(m.group(0))
     except Exception as e:
-        print(f"[Groq MCQ Error] {e}")
+        print(f"[Gemini MCQ Error] {e}")
     return 0
 
 
 async def solve_multiselect(question: str, options: list[str]) -> list[int]:
-    """Multi-Select: returns list of correct indices."""
     opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(options))
+    prompt = f"Q: {question[:180]}\n{opts}\nReturn valid JSON only: {{\"c\":[indices]}}"
     try:
-        res = await groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": 'JSON only: {"c":[indices]}'},
-                {"role": "user", "content": f"Q: {question[:180]}\n{opts}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=25,
-        )
-        data = json.loads(res.choices[0].message.content)
+        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=30)
+        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         valid = sorted({int(i) for i in data.get("c", [0]) if 0 <= int(i) < len(options)})
         return valid if valid else [0]
     except Exception as e:
-        print(f"[Groq Multi Error] {e}")
+        print(f"[Gemini Multi Error] {e}")
     return [0]
 
 
 async def solve_puzzle(question: str, items: list[str]) -> list[int]:
-    """Puzzle / Jumble: returns ordered permutation of indices (e.g. [2,0,3,1])."""
     opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(items))
     n = len(items)
+    prompt = f"Q: {question[:180]}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[...]}"
     try:
-        res = await groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": 'Order indices correctly. JSON only: {"o":[...]}'},
-                {"role": "user", "content": f"Q: {question[:180]}\n{opts}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=30,
-        )
-        data = json.loads(res.choices[0].message.content)
+        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=35)
+        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         order = [int(i) for i in data.get("o", []) if 0 <= int(i) < n]
         if len(order) == n and len(set(order)) == n:
             return order
     except Exception as e:
-        print(f"[Groq Puzzle Error] {e}")
+        print(f"[Gemini Puzzle Error] {e}")
     return list(range(n))
 
 
 async def solve_text(question: str) -> dict:
-    """Type Answer / Word Cloud / Open-Ended: returns 1 best + 3 wrong strings."""
+    prompt = f"Q: {question[:180]}\nReturn JSON only: {{\"b\":\"best short answer under 20 chars\",\"w\":[\"wrong1\",\"wrong2\",\"wrong3\"]}}"
     try:
-        res = await groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": 'JSON only: {"b":"best (<20 chars)","w":["wrong1","wrong2","wrong3"]}',
-                },
-                {"role": "user", "content": f"Q: {question[:180]}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=60,
-        )
-        data = json.loads(res.choices[0].message.content)
+        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=60)
+        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         best = str(data.get("b", "Yes"))[:20].strip()
         wrong = [str(w)[:20].strip() for w in data.get("w", ["No", "Maybe", "None"])[:3]]
         while len(wrong) < 3:
             wrong.append("Unknown")
         return {"best": best, "wrong": wrong}
     except Exception as e:
-        print(f"[Groq Text Error] {e}")
+        print(f"[Gemini Text Error] {e}")
     return {"best": "Yes", "wrong": ["No", "Maybe", "Unknown"]}
 
 
 async def solve_slider(question: str, min_v: float, max_v: float, step: float) -> dict:
-    """Slider: queries Groq ONLY for the single best number; computes 3 wrong offsets locally."""
     def snap(val: float) -> float:
         clamped = max(min_v, min(max_v, float(val)))
         if step > 0:
@@ -155,21 +133,13 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float) -
         return round(clamped, 4)
 
     best = snap((min_v + max_v) / 2)
+    prompt = f"Q: {question[:180]}\nRange:[{min_v},{max_v}]\nReturn JSON only: {{\"v\":number}}"
     try:
-        res = await groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": 'JSON only: {"v":number}'},
-                {"role": "user", "content": f"Q: {question[:180]}\nRange:[{min_v},{max_v}]"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=20,
-        )
-        data = json.loads(res.choices[0].message.content)
+        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=25)
+        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         best = snap(data.get("v", best))
     except Exception as e:
-        print(f"[Groq Slider Error] {e}")
+        print(f"[Gemini Slider Error] {e}")
 
     span = max_v - min_v
     offsets = [-0.25 * span, 0.2 * span, 0.4 * span]
@@ -183,22 +153,10 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float) -
 
 
 async def solve_pin(question: str) -> tuple[float, float]:
-    """Pin on Image / Drop Pin: returns normalized (x_pct, y_pct) in [0.15, 0.85]."""
+    prompt = f"Q: {question[:180]}\nEstimate target image coordinates (0.1 to 0.9). JSON only: {{\"x\":0.5,\"y\":0.5}}"
     try:
-        res = await groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": 'Estimate target image coordinates (0.1 to 0.9). JSON only: {"x":0.5,"y":0.5}',
-                },
-                {"role": "user", "content": f"Q: {question[:180]}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=25,
-        )
-        data = json.loads(res.choices[0].message.content)
+        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=25)
+        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         x = max(0.1, min(0.9, float(data.get("x", 0.5))))
         y = max(0.1, min(0.9, float(data.get("y", 0.5))))
         return (x, y)
@@ -207,7 +165,7 @@ async def solve_pin(question: str) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Tier Selection Logic
+# Tier Selection & Action Dispatchers (Unchanged Logic)
 # ---------------------------------------------------------------------------
 
 def pick_mcq(tier: int, best_idx: int, n: int) -> int:
@@ -244,10 +202,6 @@ def pick_puzzle(tier: int, best_order: list[int]) -> list[int]:
             break
     return random.choice(wrong_orders) if wrong_orders else best_order[::-1]
 
-
-# ---------------------------------------------------------------------------
-# Bot Action Dispatchers (1.5 - 3.0s Window)
-# ---------------------------------------------------------------------------
 
 async def wait_window(reveal_timestamp: float):
     target_delay = random.uniform(1.5, 3.0)
@@ -377,10 +331,6 @@ async def submit_pin_bot(bot: dict, best_xy: tuple[float, float], reveal_ts: flo
         print(f"[Pin Err] {bot['name']}: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Join & Main Loop
-# ---------------------------------------------------------------------------
-
 async def join_kahoot(context, pin: str, bot_info: dict) -> Page | None:
     page = await context.new_page()
     name, tier = bot_info["name"], bot_info["tier"]
@@ -449,7 +399,6 @@ async def main():
             slider_input = lead.locator('input[type="range"], input[data-functional-selector*="slider"]').first
             pin_canvas = lead.locator('[data-functional-selector*="pin-image"], [data-functional-selector*="drop-pin"]').first
 
-            # 1. Quiz / True-False / Poll / Multi-Select
             if await ans0.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
@@ -477,7 +426,6 @@ async def main():
                     except Exception:
                         pass
 
-            # 2. Puzzle / Jumble
             elif await puzzle_cards.count() >= 2 and await puzzle_cards.first.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
@@ -493,7 +441,6 @@ async def main():
                     except Exception:
                         pass
 
-            # 3. Type Answer / Open-Ended
             elif await text_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
@@ -508,7 +455,6 @@ async def main():
                     except Exception:
                         pass
 
-            # 4. Slider
             elif await slider_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
@@ -528,7 +474,6 @@ async def main():
                     except Exception:
                         pass
 
-            # 5. Pin on Image
             elif await pin_canvas.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
