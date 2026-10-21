@@ -11,6 +11,7 @@ from playwright.async_api import async_playwright, Page
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
 
+# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
 pin_match = re.search(r"pin=(\d+)", raw_pin_input)
 if pin_match:
     KAHOOT_PIN = pin_match.group(1)
@@ -18,29 +19,33 @@ else:
     KAHOOT_PIN = re.sub(r"\D", "", raw_pin_input)
 
 FIRST_CLASS_COUNT = min(max(int(os.environ.get("FIRST_CLASS_COUNT", "1")), 1), 2)
-FIRST_CLASS_NAME_1 = os.environ.get("FIRST_CLASS_NAME_1", "Bot1").strip() or "Bot1"
+FIRST_CLASS_NAME_1 = os.environ.get("FIRST_CLASS_NAME_1", "AlphaBot").strip() or "AlphaBot"
 RAW_FIRST_CLASS_NAME_2 = os.environ.get("FIRST_CLASS_NAME_2", "").strip()
 
 SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
-SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "Ref").strip() or "Ref"
+SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "RefBot").strip() or "RefBot"
 
 MODEL_NAME = "gemini-2.5-flash"
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
 
-# Initialize the official Google GenAI client
+# Initialize official Google GenAI client
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def build_bot_roster():
+    """Builds the list of 1st-class and 2nd-class bots based on workflow inputs."""
     roster = [{"name": FIRST_CLASS_NAME_1, "tier": 1}]
+
     if FIRST_CLASS_COUNT == 2:
         name_2 = RAW_FIRST_CLASS_NAME_2 if RAW_FIRST_CLASS_NAME_2 else "[default]"
         roster.append({"name": name_2, "tier": 1})
+
     for i in range(1, SECOND_CLASS_COUNT + 1):
         bot_name = f"{SECOND_CLASS_BASE_NAME}{i}" if SECOND_CLASS_COUNT > 1 else SECOND_CLASS_BASE_NAME
         roster.append({"name": bot_name, "tier": 2})
+
     return roster
 
 
@@ -65,7 +70,6 @@ async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int
         )
         return response.text or ""
 
-    # Run blocking SDK call in an executor loop to prevent blocking async tasks
     return await asyncio.to_thread(_generate)
 
 
@@ -165,7 +169,7 @@ async def solve_pin(question: str) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Tier Selection & Action Dispatchers (Unchanged Logic)
+# Tier Selection Logic
 # ---------------------------------------------------------------------------
 
 def pick_mcq(tier: int, best_idx: int, n: int) -> int:
@@ -202,6 +206,10 @@ def pick_puzzle(tier: int, best_order: list[int]) -> list[int]:
             break
     return random.choice(wrong_orders) if wrong_orders else best_order[::-1]
 
+
+# ---------------------------------------------------------------------------
+# Bot Action Dispatchers (1.5 - 3.0s Window)
+# ---------------------------------------------------------------------------
 
 async def wait_window(reveal_timestamp: float):
     target_delay = random.uniform(1.5, 3.0)
@@ -361,15 +369,23 @@ async def extract_question_text(lead_page: Page) -> str:
 
 
 async def main():
-for idx, bot_info in enumerate(roster):
-    if idx > 0:
-        delay = random.uniform(1.0, 1.5)
-        await asyncio.sleep(delay)
+    roster = build_bot_roster()
+    print(f"Starting session for Game PIN: {KAHOOT_PIN} | Total bots: {len(roster)}")
 
-    context = await browser.new_context()
-    page = await join_kahoot(context, KAHOOT_PIN, bot_info)
-    if page:
-        active_bots.append({**bot_info, "page": page, "context": context})
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        active_bots = []
+
+        # Join bots sequentially with a safe delay between each to bypass rate-limiting
+        for idx, bot_info in enumerate(roster):
+            if idx > 0:
+                delay = random.uniform(1.0, 1.5)
+                await asyncio.sleep(delay)
+
+            context = await browser.new_context()
+            page = await join_kahoot(context, KAHOOT_PIN, bot_info)
+            if page:
+                active_bots.append({**bot_info, "page": page, "context": context})
 
         if not active_bots:
             print("No bots joined. Exiting.")
