@@ -35,6 +35,14 @@ on:
         required: true
         type: string
         default: 'RefBot'
+      model_name:
+        description: '7. Gemini Model Name'
+        required: true
+        type: choice
+        options:
+          - 'gemini-2.5-pro'
+          - 'gemini-3.5-flash'
+        default: 'gemini-3.5-flash'
 
 jobs:
   run-bots:
@@ -74,6 +82,7 @@ jobs:
       - name: Run Kahoot Bots
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MODEL_NAME: ${{ inputs.model_name }}
           KAHOOT_PIN: ${{ inputs.kahoot_code }}
           FIRST_CLASS_COUNT: ${{ inputs.first_class_count }}
           FIRST_CLASS_NAME_1: ${{ inputs.first_class_name_1 }}
