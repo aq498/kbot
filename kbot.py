@@ -5,13 +5,13 @@ import random
 import re
 import time
 from google import genai
+from google.genai import types
 from playwright.async_api import async_playwright, Page
 
 # 1. Load environment variables first
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
 
-# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
 pin_match = re.search(r"pin=(\d+)", raw_pin_input)
 if pin_match:
     KAHOOT_PIN = pin_match.group(1)
@@ -30,43 +30,37 @@ MODEL_NAME = "gemini-2.5-flash"
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
 
-# Initialize official Google GenAI client
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def build_bot_roster():
-    """Builds the list of 1st-class and 2nd-class bots based on workflow inputs."""
     roster = [{"name": FIRST_CLASS_NAME_1, "tier": 1}]
-
     if FIRST_CLASS_COUNT == 2:
         name_2 = RAW_FIRST_CLASS_NAME_2 if RAW_FIRST_CLASS_NAME_2 else "[default]"
         roster.append({"name": name_2, "tier": 1})
-
     for i in range(1, SECOND_CLASS_COUNT + 1):
         bot_name = f"{SECOND_CLASS_BASE_NAME}{i}" if SECOND_CLASS_COUNT > 1 else SECOND_CLASS_BASE_NAME
         roster.append({"name": bot_name, "tier": 2})
-
     return roster
 
 
 # ---------------------------------------------------------------------------
-# Gemini Solvers (Google GenAI SDK)
+# Gemini Solvers (Google GenAI SDK with Typed Config)
 # ---------------------------------------------------------------------------
 
 async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int = 50) -> str:
-    """Helper wrapper for Gemini synchronous model generation executed in an async loop."""
     def _generate():
-        config = {
+        config_kwargs = {
             "temperature": 0.0,
             "max_output_tokens": max_tokens,
         }
         if system_instruction:
-            config["system_instruction"] = system_instruction
+            config_kwargs["system_instruction"] = system_instruction
             
         response = ai_client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
-            config=config
+            config=types.GenerateContentConfig(**config_kwargs)
         )
         return response.text or ""
 
