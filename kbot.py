@@ -361,20 +361,15 @@ async def extract_question_text(lead_page: Page) -> str:
 
 
 async def main():
-    roster = build_bot_roster()
-    print(f"Starting session for Game PIN: {KAHOOT_PIN} | Total bots: {len(roster)}")
+for idx, bot_info in enumerate(roster):
+    if idx > 0:
+        delay = random.uniform(1.0, 1.5)
+        await asyncio.sleep(delay)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        active_bots = []
-
-        for bot_info in roster:
-            if bot_info["tier"] == 2:
-                await asyncio.sleep(random.uniform(0.5, 1.0))
-            context = await browser.new_context()
-            page = await join_kahoot(context, KAHOOT_PIN, bot_info)
-            if page:
-                active_bots.append({**bot_info, "page": page, "context": context})
+    context = await browser.new_context()
+    page = await join_kahoot(context, KAHOOT_PIN, bot_info)
+    if page:
+        active_bots.append({**bot_info, "page": page, "context": context})
 
         if not active_bots:
             print("No bots joined. Exiting.")
