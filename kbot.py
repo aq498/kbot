@@ -98,7 +98,7 @@ async def solve_multiselect(question: str, options: list[str]) -> list[int]:
 async def solve_puzzle(question: str, items: list[str]) -> list[int]:
     opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(items))
     n = len(items)
-    prompt = f"Q: {question[:180]}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[...]}"
+    prompt = f"Q: {question[:180]}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[indices]}}"
     try:
         reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=35)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
