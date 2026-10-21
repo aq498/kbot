@@ -1,0 +1,68 @@
+name: Run Kahoot Simulated Competition
+
+on:
+  workflow_dispatch:
+    inputs:
+      kahoot_code:
+        description: '1. Kahoot Game PIN'
+        required: true
+        type: string
+      first_class_count:
+        description: '2. 1st Class Bot Count (Max 2)'
+        required: true
+        type: choice
+        options:
+          - '1'
+          - '2'
+        default: '1'
+      first_class_name_1:
+        description: '3. 1st Class Bot #1 Name'
+        required: true
+        type: string
+        default: 'AlphaBot'
+      first_class_name_2:
+        description: '4. 1st Class Bot #2 Name (Ignored if count is 1; defaults to [default] if blank)'
+        required: false
+        type: string
+        default: ''
+      second_class_count:
+        description: '5. 2nd Class Bot Count (Reference Bots)'
+        required: true
+        type: string
+        default: '5'
+      second_class_name:
+        description: '6. 2nd Class Bot Base Name'
+        required: true
+        type: string
+        default: 'RefBot'
+
+jobs:
+  run-bots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run Kahoot Bots
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          KAHOOT_PIN: ${{ inputs.kahoot_code }}
+          FIRST_CLASS_COUNT: ${{ inputs.first_class_count }}
+          FIRST_CLASS_NAME_1: ${{ inputs.first_class_name_1 }}
+          FIRST_CLASS_NAME_2: ${{ inputs.first_class_name_2 }}
+          SECOND_CLASS_COUNT: ${{ inputs.second_class_count }}
+          SECOND_CLASS_NAME: ${{ inputs.second_class_name }}
+        run: python kbot.py
