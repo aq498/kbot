@@ -52,13 +52,28 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+        run: pip install -r requirements.txt
+
+      - name: Get Playwright browsers path
+        id: playwright-cache
+        run: echo "dir=~/.cache/ms-playwright" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: cache-playwright
+        with:
+          path: ${{ steps.playwright-cache.outputs.dir }}
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Browser (if not cached)
+        if: steps.cache-playwright.outputs.cache-hit != 'true'
+        run: playwright install chromium
 
       - name: Run Kahoot Bots
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           KAHOOT_PIN: ${{ inputs.kahoot_code }}
           FIRST_CLASS_COUNT: ${{ inputs.first_class_count }}
           FIRST_CLASS_NAME_1: ${{ inputs.first_class_name_1 }}
