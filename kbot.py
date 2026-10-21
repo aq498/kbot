@@ -12,6 +12,7 @@ from playwright.async_api import async_playwright, Page
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
 
+# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
 pin_match = re.search(r"pin=(\d+)", raw_pin_input)
 if pin_match:
     KAHOOT_PIN = pin_match.group(1)
@@ -25,30 +26,37 @@ RAW_FIRST_CLASS_NAME_2 = os.environ.get("FIRST_CLASS_NAME_2", "").strip()
 SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
 SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "RefBot").strip() or "RefBot"
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-pro").strip() or "gemini-1.5-pro"
+# Model selection from GitHub Action inputs (defaults to gemini-2.5-pro)
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
 
+# Initialize official Google GenAI client
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def build_bot_roster():
+    """Builds the list of 1st-class and 2nd-class bots based on workflow inputs."""
     roster = [{"name": FIRST_CLASS_NAME_1, "tier": 1}]
+
     if FIRST_CLASS_COUNT == 2:
         name_2 = RAW_FIRST_CLASS_NAME_2 if RAW_FIRST_CLASS_NAME_2 else "[default]"
         roster.append({"name": name_2, "tier": 1})
+
     for i in range(1, SECOND_CLASS_COUNT + 1):
         bot_name = f"{SECOND_CLASS_BASE_NAME}{i}" if SECOND_CLASS_COUNT > 1 else SECOND_CLASS_BASE_NAME
         roster.append({"name": bot_name, "tier": 2})
+
     return roster
 
 
 # ---------------------------------------------------------------------------
-# Gemini Solvers (Google GenAI SDK with Typed Config)
+# Gemini Solvers (Multimodal Vision & Typed Config)
 # ---------------------------------------------------------------------------
 
-async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int = 50) -> str:
+async def call_gemini(prompt: str, image_bytes: bytes = None, system_instruction: str = "", max_tokens: int = 50) -> str:
+    """Helper wrapper for Gemini multimodal generation executed in an async loop."""
     def _generate():
         config_kwargs = {
             "temperature": 0.0,
@@ -57,9 +65,13 @@ async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int
         if system_instruction:
             config_kwargs["system_instruction"] = system_instruction
             
+        contents = [prompt]
+        if image_bytes:
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+            
         response = ai_client.models.generate_content(
             model=MODEL_NAME,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(**config_kwargs)
         )
         return response.text or ""
@@ -67,24 +79,39 @@ async def call_gemini(prompt: str, system_instruction: str = "", max_tokens: int
     return await asyncio.to_thread(_generate)
 
 
-async def solve_mcq(question: str, options: list[str]) -> int:
-    opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(options))
-    prompt = f"Q: {question[:180]}\n{opts}\nReply ONLY with the correct option digit (0-3)."
+async def solve_mcq(question: str, options: list[str], image_bytes: bytes = None) -> int:
+    """Accurate MCQ solver with full option text and explicit indexing."""
+    opts = "\n-----\n".join([f"Option Index [{i}]: {opt}" for i, opt in enumerate(options)])
+    prompt = (
+        f"Analyze this Kahoot quiz question and screenshot carefully.\n\n"
+        f"Question: {question}\n\n"
+        f"Available Choices:\n{opts}\n\n"
+        "Task: Determine the single correct choice.\n"
+        "Respond with ONLY the integer index number (0, 1, 2, or 3) corresponding to the correct option."
+    )
     try:
-        reply = await call_gemini(prompt, system_instruction="You are a precise quiz solver.", max_tokens=5)
-        m = re.search(r"[0-3]", reply)
-        if m and int(m.group(0)) < len(options):
-            return int(m.group(0))
+        reply = await call_gemini(
+            prompt, 
+            image_bytes=image_bytes, 
+            system_instruction="You are a genius academic expert. You always pick the correct answer index.", 
+            max_tokens=10
+        )
+        m = re.search(r"\b([0-3])\b", reply)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(options):
+                print(f"[AlphaBot Decision] Chose Index {idx} ({options[idx]})")
+                return idx
     except Exception as e:
         print(f"[Gemini MCQ Error] {e}")
     return 0
 
 
-async def solve_multiselect(question: str, options: list[str]) -> list[int]:
-    opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(options))
-    prompt = f"Q: {question[:180]}\n{opts}\nReturn valid JSON only: {{\"c\":[indices]}}"
+async def solve_multiselect(question: str, options: list[str], image_bytes: bytes = None) -> list[int]:
+    opts = "\n".join(f"{i}:{o}" for i, o in enumerate(options))
+    prompt = f"Q: {question}\n{opts}\nReturn valid JSON only: {{\"c\":[indices]}}"
     try:
-        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=30)
+        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=30)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         valid = sorted({int(i) for i in data.get("c", [0]) if 0 <= int(i) < len(options)})
         return valid if valid else [0]
@@ -93,12 +120,12 @@ async def solve_multiselect(question: str, options: list[str]) -> list[int]:
     return [0]
 
 
-async def solve_puzzle(question: str, items: list[str]) -> list[int]:
-    opts = "\n".join(f"{i}:{o[:60]}" for i, o in enumerate(items))
+async def solve_puzzle(question: str, items: list[str], image_bytes: bytes = None) -> list[int]:
+    opts = "\n".join(f"{i}:{o}" for i, o in enumerate(items))
     n = len(items)
-    prompt = f"Q: {question[:180]}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[indices]}}"
+    prompt = f"Q: {question}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[indices]}}"
     try:
-        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=35)
+        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=35)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         order = [int(i) for i in data.get("o", []) if 0 <= int(i) < n]
         if len(order) == n and len(set(order)) == n:
@@ -108,10 +135,10 @@ async def solve_puzzle(question: str, items: list[str]) -> list[int]:
     return list(range(n))
 
 
-async def solve_text(question: str) -> dict:
-    prompt = f"Q: {question[:180]}\nReturn JSON only: {{\"b\":\"best short answer under 20 chars\",\"w\":[\"wrong1\",\"wrong2\",\"wrong3\"]}}"
+async def solve_text(question: str, image_bytes: bytes = None) -> dict:
+    prompt = f"Q: {question}\nReturn JSON only: {{\"b\":\"best short answer under 20 chars\",\"w\":[\"wrong1\",\"wrong2\",\"wrong3\"]}}"
     try:
-        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=60)
+        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=60)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         best = str(data.get("b", "Yes"))[:20].strip()
         wrong = [str(w)[:20].strip() for w in data.get("w", ["No", "Maybe", "None"])[:3]]
@@ -123,7 +150,7 @@ async def solve_text(question: str) -> dict:
     return {"best": "Yes", "wrong": ["No", "Maybe", "Unknown"]}
 
 
-async def solve_slider(question: str, min_v: float, max_v: float, step: float) -> dict:
+async def solve_slider(question: str, min_v: float, max_v: float, step: float, image_bytes: bytes = None) -> dict:
     def snap(val: float) -> float:
         clamped = max(min_v, min(max_v, float(val)))
         if step > 0:
@@ -131,9 +158,9 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float) -
         return round(clamped, 4)
 
     best = snap((min_v + max_v) / 2)
-    prompt = f"Q: {question[:180]}\nRange:[{min_v},{max_v}]\nReturn JSON only: {{\"v\":number}}"
+    prompt = f"Q: {question}\nRange:[{min_v},{max_v}]\nReturn JSON only: {{\"v\":number}}"
     try:
-        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=25)
+        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=25)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         best = snap(data.get("v", best))
     except Exception as e:
@@ -150,10 +177,10 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float) -
     return {"best": best, "wrong": wrong}
 
 
-async def solve_pin(question: str) -> tuple[float, float]:
-    prompt = f"Q: {question[:180]}\nEstimate target image coordinates (0.1 to 0.9). JSON only: {{\"x\":0.5,\"y\":0.5}}"
+async def solve_pin(question: str, image_bytes: bytes = None) -> tuple[float, float]:
+    prompt = f"Q: {question}\nEstimate target image coordinates (0.1 to 0.9). JSON only: {{\"x\":0.5,\"y\":0.5}}"
     try:
-        reply = await call_gemini(prompt, system_instruction="Output JSON format only.", max_tokens=25)
+        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=25)
         data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
         x = max(0.1, min(0.9, float(data.get("x", 0.5))))
         y = max(0.1, min(0.9, float(data.get("y", 0.5))))
@@ -202,11 +229,16 @@ def pick_puzzle(tier: int, best_order: list[int]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Bot Action Dispatchers (1.5 - 3.0s Window)
+# Bot Action Dispatchers (Tier 1 = Instant Speed | Tier 2 = Slow Reference)
 # ---------------------------------------------------------------------------
 
-async def wait_window(reveal_timestamp: float):
-    target_delay = random.uniform(1.5, 3.0)
+async def wait_window(tier: int, reveal_timestamp: float):
+    if tier == 1:
+        # AlphaBot strikes instantly to maximize speed points
+        target_delay = random.uniform(0.2, 0.4)
+    else:
+        # 2nd class reference bots stay slow (1.5 - 3.0s)
+        target_delay = random.uniform(1.5, 3.0)
     await asyncio.sleep(max(0.0, target_delay - (time.monotonic() - reveal_timestamp)))
 
 
@@ -218,7 +250,7 @@ async def click_submit_if_present(page: Page):
 
 
 async def submit_mcq_bot(bot: dict, best_idx: int, n: int, reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     idx = pick_mcq(bot["tier"], best_idx, n)
     try:
         btn = bot["page"].locator(f'[data-functional-selector="answer-{idx}"]')
@@ -230,7 +262,7 @@ async def submit_mcq_bot(bot: dict, best_idx: int, n: int, reveal_ts: float):
 
 
 async def submit_multi_bot(bot: dict, best_indices: list[int], n: int, reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     indices = pick_multiselect(bot["tier"], best_indices, n)
     try:
         for idx in indices:
@@ -245,7 +277,7 @@ async def submit_multi_bot(bot: dict, best_indices: list[int], n: int, reveal_ts
 
 
 async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     target_order = pick_puzzle(bot["tier"], best_order)
     page: Page = bot["page"]
     card_sel = '[data-functional-selector*="jumble-card"], [data-functional-selector*="puzzle-card"], [draggable="true"]'
@@ -273,7 +305,7 @@ async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], 
 
 
 async def submit_text_bot(bot: dict, text_pack: dict, reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     ans = text_pack["best"] if (bot["tier"] == 1 or random.random() < 0.5) else random.choice(text_pack["wrong"])
     page: Page = bot["page"]
     input_sel = 'input[data-functional-selector*="text-answer"], textarea[data-functional-selector*="open-ended"], input[placeholder*="answer" i], textarea'
@@ -289,7 +321,7 @@ async def submit_text_bot(bot: dict, text_pack: dict, reveal_ts: float):
 
 
 async def submit_slider_bot(bot: dict, slider_pack: dict, reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     val = slider_pack["best"] if (bot["tier"] == 1 or random.random() < 0.5) else random.choice(slider_pack["wrong"])
     val_str = str(int(val)) if float(val).is_integer() else str(val)
     page: Page = bot["page"]
@@ -312,7 +344,7 @@ async def submit_slider_bot(bot: dict, slider_pack: dict, reveal_ts: float):
 
 
 async def submit_pin_bot(bot: dict, best_xy: tuple[float, float], reveal_ts: float):
-    await wait_window(reveal_ts)
+    await wait_window(bot["tier"], reveal_ts)
     if bot["tier"] == 1 or random.random() < 0.5:
         x_pct, y_pct = best_xy
     else:
@@ -370,7 +402,7 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         active_bots = []
 
-        # Join bots sequentially with a safe delay between each to bypass rate-limiting
+        # Join bots sequentially with a safe delay to bypass rate-limiting
         for idx, bot_info in enumerate(roster):
             if idx > 0:
                 delay = random.uniform(1.0, 1.5)
@@ -407,6 +439,10 @@ async def main():
             if await ans0.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
+                
+                # Take screenshot so Gemini can see images, graphs, and equations!
+                question_screenshot = await lead.screenshot()
+
                 ms_btn = lead.locator('button[data-functional-selector="multi-select-submit-button"]')
                 is_multi = (await ms_btn.count()) > 0
 
@@ -421,10 +457,10 @@ async def main():
                     last_sig = sig
                     idle_ticks = 0
                     if is_multi:
-                        best_indices = await solve_multiselect(q_text, options)
+                        best_indices = await solve_multiselect(q_text, options, image_bytes=question_screenshot)
                         await asyncio.gather(*(submit_multi_bot(b, best_indices, len(options), reveal_ts) for b in active_bots))
                     else:
-                        best_idx = await solve_mcq(q_text, options)
+                        best_idx = await solve_mcq(q_text, options, image_bytes=question_screenshot)
                         await asyncio.gather(*(submit_mcq_bot(b, best_idx, len(options), reveal_ts) for b in active_bots))
                     try:
                         await ans0.wait_for(state="hidden", timeout=60000)
@@ -434,12 +470,13 @@ async def main():
             elif await puzzle_cards.count() >= 2 and await puzzle_cards.first.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
+                question_screenshot = await lead.screenshot()
                 items = [(await puzzle_cards.nth(i).inner_text()).strip() for i in range(await puzzle_cards.count())]
                 sig = f"PUZZLE|{q_text}|{'|'.join(items)}"
                 if sig != last_sig and items:
                     last_sig = sig
                     idle_ticks = 0
-                    best_order = await solve_puzzle(q_text, items)
+                    best_order = await solve_puzzle(q_text, items, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_puzzle_bot(b, items, best_order, reveal_ts) for b in active_bots))
                     try:
                         await puzzle_cards.first.wait_for(state="hidden", timeout=60000)
@@ -449,11 +486,12 @@ async def main():
             elif await text_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
+                question_screenshot = await lead.screenshot()
                 sig = f"TEXT|{q_text}"
                 if sig != last_sig:
                     last_sig = sig
                     idle_ticks = 0
-                    text_pack = await solve_text(q_text)
+                    text_pack = await solve_text(q_text, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_text_bot(b, text_pack, reveal_ts) for b in active_bots))
                     try:
                         await text_input.wait_for(state="hidden", timeout=60000)
@@ -463,6 +501,7 @@ async def main():
             elif await slider_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
+                question_screenshot = await lead.screenshot()
                 min_v = float((await slider_input.get_attribute("min")) or 0)
                 max_v = float((await slider_input.get_attribute("max")) or 100)
                 step_attr = await slider_input.get_attribute("step")
@@ -472,7 +511,7 @@ async def main():
                 if sig != last_sig:
                     last_sig = sig
                     idle_ticks = 0
-                    slider_pack = await solve_slider(q_text, min_v, max_v, step_v)
+                    slider_pack = await solve_slider(q_text, min_v, max_v, step_v, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_slider_bot(b, slider_pack, reveal_ts) for b in active_bots))
                     try:
                         await slider_input.wait_for(state="hidden", timeout=60000)
@@ -482,11 +521,12 @@ async def main():
             elif await pin_canvas.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
+                question_screenshot = await lead.screenshot()
                 sig = f"PIN|{q_text}"
                 if sig != last_sig:
                     last_sig = sig
                     idle_ticks = 0
-                    best_xy = await solve_pin(q_text)
+                    best_xy = await solve_pin(q_text, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_pin_bot(b, best_xy, reveal_ts) for b in active_bots))
                     try:
                         await pin_canvas.wait_for(state="hidden", timeout=60000)
