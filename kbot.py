@@ -7,9 +7,16 @@ import time
 from groq import AsyncGroq
 from playwright.async_api import async_playwright, Page
 
-# Load environment variables from GitHub Actions
+# 1. Load environment variables first
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-KAHOOT_PIN = os.environ.get("KAHOOT_PIN", "").strip()
+raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
+
+# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
+pin_match = re.search(r"pin=(\d+)", raw_pin_input)
+if pin_match:
+    KAHOOT_PIN = pin_match.group(1)
+else:
+    KAHOOT_PIN = re.sub(r"\D", "", raw_pin_input)
 
 FIRST_CLASS_COUNT = min(max(int(os.environ.get("FIRST_CLASS_COUNT", "1")), 1), 2)
 FIRST_CLASS_NAME_1 = os.environ.get("FIRST_CLASS_NAME_1", "Bot1").strip() or "Bot1"
@@ -164,7 +171,6 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float) -
     except Exception as e:
         print(f"[Groq Slider Error] {e}")
 
-    # Generate 3 distinct wrong values locally to save tokens
     span = max_v - min_v
     offsets = [-0.25 * span, 0.2 * span, 0.4 * span]
     wrong = []
@@ -201,7 +207,7 @@ async def solve_pin(question: str) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Tier Selection Logic (Tier 1 = 100% Best | Tier 2 = 50% Best, 50% of 3 Wrong)
+# Tier Selection Logic
 # ---------------------------------------------------------------------------
 
 def pick_mcq(tier: int, best_idx: int, n: int) -> int:
@@ -249,10 +255,7 @@ async def wait_window(reveal_timestamp: float):
 
 
 async def click_submit_if_present(page: Page):
-    submit_sel = (
-        'button[data-functional-selector*="submit"], '
-        'button[type="submit"]'
-    )
+    submit_sel = 'button[data-functional-selector*="submit"], button[type="submit"]'
     btn = page.locator(submit_sel).first
     if await btn.count() > 0 and await btn.is_visible(timeout=800):
         await btn.click()
@@ -289,14 +292,12 @@ async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], 
     await wait_window(reveal_ts)
     target_order = pick_puzzle(bot["tier"], best_order)
     page: Page = bot["page"]
-
     card_sel = '[data-functional-selector*="jumble-card"], [data-functional-selector*="puzzle-card"], [draggable="true"]'
     try:
         for target_pos, orig_idx in enumerate(target_order):
             target_text = items[orig_idx]
             cards = page.locator(card_sel)
             count = await cards.count()
-            # Find where target_text currently sits and drag it to target_pos
             for cur_pos in range(count):
                 txt = (await cards.nth(cur_pos).inner_text()).strip()
                 if txt == target_text and cur_pos != target_pos:
@@ -305,9 +306,7 @@ async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], 
                     if src_box and dst_box:
                         await page.mouse.move(src_box["x"] + src_box["width"] / 2, src_box["y"] + src_box["height"] / 2)
                         await page.mouse.down()
-                        await page.mouse.move(
-                            dst_box["x"] + dst_box["width"] / 2, dst_box["y"] + dst_box["height"] / 2, steps=6
-                        )
+                        await page.mouse.move(dst_box["x"] + dst_box["width"] / 2, dst_box["y"] + dst_box["height"] / 2, steps=6)
                         await page.mouse.up()
                         await asyncio.sleep(0.08)
                     break
@@ -321,11 +320,7 @@ async def submit_text_bot(bot: dict, text_pack: dict, reveal_ts: float):
     await wait_window(reveal_ts)
     ans = text_pack["best"] if (bot["tier"] == 1 or random.random() < 0.5) else random.choice(text_pack["wrong"])
     page: Page = bot["page"]
-    input_sel = (
-        'input[data-functional-selector*="text-answer"], '
-        'textarea[data-functional-selector*="open-ended"], '
-        'input[placeholder*="answer" i], textarea'
-    )
+    input_sel = 'input[data-functional-selector*="text-answer"], textarea[data-functional-selector*="open-ended"], input[placeholder*="answer" i], textarea'
     try:
         box = page.locator(input_sel).first
         if await box.is_visible(timeout=1000):
@@ -450,9 +445,7 @@ async def main():
 
             ans0 = lead.locator('[data-functional-selector="answer-0"]')
             puzzle_cards = lead.locator('[data-functional-selector*="jumble-card"], [data-functional-selector*="puzzle-card"]')
-            text_input = lead.locator(
-                'input[data-functional-selector*="text-answer"], textarea[data-functional-selector*="open-ended"]'
-            ).first
+            text_input = lead.locator('input[data-functional-selector*="text-answer"], textarea[data-functional-selector*="open-ended"]').first
             slider_input = lead.locator('input[type="range"], input[data-functional-selector*="slider"]').first
             pin_canvas = lead.locator('[data-functional-selector*="pin-image"], [data-functional-selector*="drop-pin"]').first
 
@@ -500,7 +493,7 @@ async def main():
                     except Exception:
                         pass
 
-            # 3. Type Answer / Word Cloud / Open-Ended
+            # 3. Type Answer / Open-Ended
             elif await text_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
@@ -535,7 +528,7 @@ async def main():
                     except Exception:
                         pass
 
-            # 5. Pin on Image / Drop Pin
+            # 5. Pin on Image
             elif await pin_canvas.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
