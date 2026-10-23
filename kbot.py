@@ -4,6 +4,8 @@ import os
 import random
 import re
 import time
+from typing import Any
+import pydantic
 from google import genai
 from google.genai import types
 from playwright.async_api import async_playwright, Page
@@ -12,7 +14,6 @@ from playwright.async_api import async_playwright, Page
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 raw_pin_input = os.environ.get("KAHOOT_PIN", "").strip()
 
-# 2. Clean up KAHOOT_PIN automatically whether they type numbers or paste a full URL
 pin_match = re.search(r"pin=(\d+)", raw_pin_input)
 if pin_match:
     KAHOOT_PIN = pin_match.group(1)
@@ -26,41 +27,35 @@ RAW_FIRST_CLASS_NAME_2 = os.environ.get("FIRST_CLASS_NAME_2", "").strip()
 SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
 SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "RefBot").strip() or "RefBot"
 
-# Model selection from GitHub Action inputs (defaults to gemini-2.5-pro)
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
 
-# Initialize official Google GenAI client
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def build_bot_roster():
-    """Builds the list of 1st-class and 2nd-class bots based on workflow inputs."""
     roster = [{"name": FIRST_CLASS_NAME_1, "tier": 1}]
-
     if FIRST_CLASS_COUNT == 2:
         name_2 = RAW_FIRST_CLASS_NAME_2 if RAW_FIRST_CLASS_NAME_2 else "[default]"
         roster.append({"name": name_2, "tier": 1})
-
     for i in range(1, SECOND_CLASS_COUNT + 1):
         bot_name = f"{SECOND_CLASS_BASE_NAME}{i}" if SECOND_CLASS_COUNT > 1 else SECOND_CLASS_BASE_NAME
         roster.append({"name": bot_name, "tier": 2})
-
     return roster
 
 
 # ---------------------------------------------------------------------------
-# Gemini Solvers (Multimodal Vision & Typed Config)
+# Gemini Structured JSON Solvers (Pydantic Schema Enforced)
 # ---------------------------------------------------------------------------
 
-async def call_gemini(prompt: str, image_bytes: bytes = None, system_instruction: str = "", max_tokens: int = 50) -> str:
-    """Helper wrapper for Gemini multimodal generation executed in an async loop."""
+async def call_gemini_json(prompt: str, response_schema: type, image_bytes: bytes = None, system_instruction: str = "") -> Any:
     def _generate():
         config_kwargs = {
             "temperature": 0.0,
-            "max_output_tokens": max_tokens,
+            "response_mime_type": "application/json",
+            "response_schema": response_schema,
         }
         if system_instruction:
             config_kwargs["system_instruction"] = system_instruction
@@ -74,60 +69,66 @@ async def call_gemini(prompt: str, image_bytes: bytes = None, system_instruction
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs)
         )
-        return response.text or ""
+        return json.loads(response.text or "{}")
 
     return await asyncio.to_thread(_generate)
 
 
+class MCQResponse(pydantic.BaseModel):
+    correct_index: int
+
+
 async def solve_mcq(question: str, options: list[str], image_bytes: bytes = None) -> int:
-    """Accurate MCQ solver with full option text and explicit indexing."""
-    opts = "\n-----\n".join([f"Option Index [{i}]: {opt}" for i, opt in enumerate(options)])
+    opts_str = "\n".join([f"Index [{i}]: {opt}" for i, opt in enumerate(options)])
     prompt = (
-        f"Analyze this Kahoot quiz question and screenshot carefully.\n\n"
+        f"Analyze this Kahoot question and screenshot carefully.\n"
         f"Question: {question}\n\n"
-        f"Available Choices:\n{opts}\n\n"
-        "Task: Determine the single correct choice.\n"
-        "Respond with ONLY the integer index number (0, 1, 2, or 3) corresponding to the correct option."
+        f"Available Options:\n{opts_str}\n\n"
+        f"Select the correct option index (0 to {len(options)-1})."
     )
     try:
-        reply = await call_gemini(
+        result = await call_gemini_json(
             prompt, 
+            response_schema=MCQResponse, 
             image_bytes=image_bytes, 
-            system_instruction="You are a genius academic expert. You always pick the correct answer index.", 
-            max_tokens=10
+            system_instruction="You are an expert academic trivia solver. Accurately identify the correct option index."
         )
-        m = re.search(r"\b([0-3])\b", reply)
-        if m:
-            idx = int(m.group(1))
-            if 0 <= idx < len(options):
-                print(f"[AlphaBot Decision] Chose Index {idx} ({options[idx]})")
-                return idx
+        idx = int(result.get("correct_index", 0))
+        if 0 <= idx < len(options):
+            print(f"[AlphaBot High-Accuracy Match] Chose Index {idx} -> {options[idx]}")
+            return idx
     except Exception as e:
-        print(f"[Gemini MCQ Error] {e}")
+        print(f"[Gemini Structured MCQ Error] {e}")
     return 0
 
 
+class MultiResponse(pydantic.BaseModel):
+    indices: list[int]
+
+
 async def solve_multiselect(question: str, options: list[str], image_bytes: bytes = None) -> list[int]:
-    opts = "\n".join(f"{i}:{o}" for i, o in enumerate(options))
-    prompt = f"Q: {question}\n{opts}\nReturn valid JSON only: {{\"c\":[indices]}}"
+    opts = "\n".join(f"Index [{i}]: {o}" for i, o in enumerate(options))
+    prompt = f"Q: {question}\n{opts}\nSelect all correct option indices."
     try:
-        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=30)
-        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
-        valid = sorted({int(i) for i in data.get("c", [0]) if 0 <= int(i) < len(options)})
+        result = await call_gemini_json(prompt, response_schema=MultiResponse, image_bytes=image_bytes, system_instruction="Output valid indices array.")
+        valid = sorted({int(i) for i in result.get("indices", [0]) if 0 <= int(i) < len(options)})
         return valid if valid else [0]
     except Exception as e:
         print(f"[Gemini Multi Error] {e}")
     return [0]
 
 
+class PuzzleResponse(pydantic.BaseModel):
+    order: list[int]
+
+
 async def solve_puzzle(question: str, items: list[str], image_bytes: bytes = None) -> list[int]:
-    opts = "\n".join(f"{i}:{o}" for i, o in enumerate(items))
+    opts = "\n".join(f"Index [{i}]: {o}" for i, o in enumerate(items))
     n = len(items)
-    prompt = f"Q: {question}\n{opts}\nOrder items correctly. Return JSON only: {{\"o\":[indices]}}"
+    prompt = f"Q: {question}\n{opts}\nOrder items correctly by index."
     try:
-        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=35)
-        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
-        order = [int(i) for i in data.get("o", []) if 0 <= int(i) < n]
+        result = await call_gemini_json(prompt, response_schema=PuzzleResponse, image_bytes=image_bytes, system_instruction="Output correct sequence order.")
+        order = [int(i) for i in result.get("order", []) if 0 <= int(i) < n]
         if len(order) == n and len(set(order)) == n:
             return order
     except Exception as e:
@@ -135,19 +136,27 @@ async def solve_puzzle(question: str, items: list[str], image_bytes: bytes = Non
     return list(range(n))
 
 
+class TextResponse(pydantic.BaseModel):
+    best_answer: str
+    wrong_alternatives: list[str]
+
+
 async def solve_text(question: str, image_bytes: bytes = None) -> dict:
-    prompt = f"Q: {question}\nReturn JSON only: {{\"b\":\"best short answer under 20 chars\",\"w\":[\"wrong1\",\"wrong2\",\"wrong3\"]}}"
+    prompt = f"Q: {question}\nProvide the best short answer (under 20 chars) and 3 plausible wrong answers."
     try:
-        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=60)
-        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
-        best = str(data.get("b", "Yes"))[:20].strip()
-        wrong = [str(w)[:20].strip() for w in data.get("w", ["No", "Maybe", "None"])[:3]]
+        result = await call_gemini_json(prompt, response_schema=TextResponse, image_bytes=image_bytes, system_instruction="Provide concise text answers.")
+        best = str(result.get("best_answer", "Yes"))[:20].strip()
+        wrong = [str(w)[:20].strip() for w in result.get("wrong_alternatives", ["No", "Maybe", "None"])[:3]]
         while len(wrong) < 3:
             wrong.append("Unknown")
         return {"best": best, "wrong": wrong}
     except Exception as e:
         print(f"[Gemini Text Error] {e}")
     return {"best": "Yes", "wrong": ["No", "Maybe", "Unknown"]}
+
+
+class SliderResponse(pydantic.BaseModel):
+    value: float
 
 
 async def solve_slider(question: str, min_v: float, max_v: float, step: float, image_bytes: bytes = None) -> dict:
@@ -158,74 +167,32 @@ async def solve_slider(question: str, min_v: float, max_v: float, step: float, i
         return round(clamped, 4)
 
     best = snap((min_v + max_v) / 2)
-    prompt = f"Q: {question}\nRange:[{min_v},{max_v}]\nReturn JSON only: {{\"v\":number}}"
+    prompt = f"Q: {question}\nRange:[{min_v},{max_v}]\nEstimate target numeric value."
     try:
-        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=25)
-        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
-        best = snap(data.get("v", best))
+        result = await call_gemini_json(prompt, response_schema=SliderResponse, image_bytes=image_bytes, system_instruction="Provide numeric slider value.")
+        best = snap(result.get("value", best))
     except Exception as e:
         print(f"[Gemini Slider Error] {e}")
 
     span = max_v - min_v
-    offsets = [-0.25 * span, 0.2 * span, 0.4 * span]
-    wrong = []
-    for off in offsets:
-        cand = snap(best + off)
-        if cand == best:
-            cand = snap(min_v if best > min_v else max_v)
-        wrong.append(cand)
+    wrong = [snap(best + off) for off in [-0.25 * span, 0.2 * span, 0.4 * span]]
     return {"best": best, "wrong": wrong}
 
 
+class PinResponse(pydantic.BaseModel):
+    x: float
+    y: float
+
+
 async def solve_pin(question: str, image_bytes: bytes = None) -> tuple[float, float]:
-    prompt = f"Q: {question}\nEstimate target image coordinates (0.1 to 0.9). JSON only: {{\"x\":0.5,\"y\":0.5}}"
+    prompt = f"Q: {question}\nEstimate target image coordinates (0.1 to 0.9)."
     try:
-        reply = await call_gemini(prompt, image_bytes=image_bytes, system_instruction="Output JSON format only.", max_tokens=25)
-        data = json.loads(reply.strip().replace("```json", "").replace("```", ""))
-        x = max(0.1, min(0.9, float(data.get("x", 0.5))))
-        y = max(0.1, min(0.9, float(data.get("y", 0.5))))
+        result = await call_gemini_json(prompt, response_schema=PinResponse, image_bytes=image_bytes, system_instruction="Provide coordinate map x and y.")
+        x = max(0.1, min(0.9, float(result.get("x", 0.5))))
+        y = max(0.1, min(0.9, float(result.get("y", 0.5))))
         return (x, y)
     except Exception:
         return (0.5, 0.5)
-
-
-# ---------------------------------------------------------------------------
-# Tier Selection Logic
-# ---------------------------------------------------------------------------
-
-def pick_mcq(tier: int, best_idx: int, n: int) -> int:
-    if tier == 1 or n <= 1 or random.random() < 0.5:
-        return best_idx
-    wrong = [i for i in range(n) if i != best_idx]
-    return random.choice(wrong)
-
-
-def pick_multiselect(tier: int, best_indices: list[int], n: int) -> list[int]:
-    if tier == 1 or n <= 1 or random.random() < 0.5:
-        return best_indices
-    all_idx = list(range(n))
-    wrong_subsets = []
-    for _ in range(15):
-        cand = sorted(random.sample(all_idx, random.randint(1, max(1, n - 1))))
-        if cand != best_indices and cand not in wrong_subsets:
-            wrong_subsets.append(cand)
-        if len(wrong_subsets) == 3:
-            break
-    return random.choice(wrong_subsets) if wrong_subsets else [0]
-
-
-def pick_puzzle(tier: int, best_order: list[int]) -> list[int]:
-    if tier == 1 or random.random() < 0.5:
-        return best_order
-    wrong_orders = []
-    for _ in range(15):
-        cand = best_order[:]
-        random.shuffle(cand)
-        if cand != best_order and cand not in wrong_orders:
-            wrong_orders.append(cand)
-        if len(wrong_orders) == 3:
-            break
-    return random.choice(wrong_orders) if wrong_orders else best_order[::-1]
 
 
 # ---------------------------------------------------------------------------
@@ -234,11 +201,9 @@ def pick_puzzle(tier: int, best_order: list[int]) -> list[int]:
 
 async def wait_window(tier: int, reveal_timestamp: float):
     if tier == 1:
-        # AlphaBot strikes instantly to maximize speed points
-        target_delay = random.uniform(0.2, 0.4)
+        target_delay = random.uniform(0.1, 0.3)  # Ultra-fast reflexes
     else:
-        # 2nd class reference bots stay slow (1.5 - 3.0s)
-        target_delay = random.uniform(1.5, 3.0)
+        target_delay = random.uniform(1.5, 3.0)  # Slow reference bots
     await asyncio.sleep(max(0.0, target_delay - (time.monotonic() - reveal_timestamp)))
 
 
@@ -251,34 +216,32 @@ async def click_submit_if_present(page: Page):
 
 async def submit_mcq_bot(bot: dict, best_idx: int, n: int, reveal_ts: float):
     await wait_window(bot["tier"], reveal_ts)
-    idx = pick_mcq(bot["tier"], best_idx, n)
+    idx = best_idx if bot["tier"] == 1 or random.random() < 0.5 else random.choice([i for i in range(n) if i != best_idx])
     try:
         btn = bot["page"].locator(f'[data-functional-selector="answer-{idx}"]')
         if await btn.is_visible(timeout=1000):
             await btn.click()
-            print(f"[MCQ] {bot['name']} (C{bot['tier']}) -> {idx} ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[MCQ Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def submit_multi_bot(bot: dict, best_indices: list[int], n: int, reveal_ts: float):
     await wait_window(bot["tier"], reveal_ts)
-    indices = pick_multiselect(bot["tier"], best_indices, n)
+    indices = best_indices if bot["tier"] == 1 or random.random() < 0.5 else [0]
     try:
         for idx in indices:
             btn = bot["page"].locator(f'[data-functional-selector="answer-{idx}"]')
             if await btn.is_visible(timeout=800):
                 await btn.click()
-                await asyncio.sleep(0.06)
+                await asyncio.sleep(0.04)
         await click_submit_if_present(bot["page"])
-        print(f"[Multi] {bot['name']} (C{bot['tier']}) -> {indices} ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[Multi Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], reveal_ts: float):
     await wait_window(bot["tier"], reveal_ts)
-    target_order = pick_puzzle(bot["tier"], best_order)
+    target_order = best_order if bot["tier"] == 1 or random.random() < 0.5 else best_order[::-1]
     page: Page = bot["page"]
     card_sel = '[data-functional-selector*="jumble-card"], [data-functional-selector*="puzzle-card"], [draggable="true"]'
     try:
@@ -294,14 +257,12 @@ async def submit_puzzle_bot(bot: dict, items: list[str], best_order: list[int], 
                     if src_box and dst_box:
                         await page.mouse.move(src_box["x"] + src_box["width"] / 2, src_box["y"] + src_box["height"] / 2)
                         await page.mouse.down()
-                        await page.mouse.move(dst_box["x"] + dst_box["width"] / 2, dst_box["y"] + dst_box["height"] / 2, steps=6)
+                        await page.mouse.move(dst_box["x"] + dst_box["width"] / 2, dst_box["y"] + dst_box["height"] / 2, steps=4)
                         await page.mouse.up()
-                        await asyncio.sleep(0.08)
                     break
         await click_submit_if_present(page)
-        print(f"[Puzzle] {bot['name']} (C{bot['tier']}) -> {target_order} ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[Puzzle Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def submit_text_bot(bot: dict, text_pack: dict, reveal_ts: float):
@@ -315,9 +276,8 @@ async def submit_text_bot(bot: dict, text_pack: dict, reveal_ts: float):
             await box.fill(ans)
             await click_submit_if_present(page)
             await box.press("Enter")
-            print(f"[Text] {bot['name']} (C{bot['tier']}) -> '{ans}' ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[Text Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def submit_slider_bot(bot: dict, slider_pack: dict, reveal_ts: float):
@@ -338,19 +298,13 @@ async def submit_slider_bot(bot: dict, slider_pack: dict, reveal_ts: float):
                 val_str,
             )
             await click_submit_if_present(page)
-            print(f"[Slider] {bot['name']} (C{bot['tier']}) -> {val_str} ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[Slider Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def submit_pin_bot(bot: dict, best_xy: tuple[float, float], reveal_ts: float):
     await wait_window(bot["tier"], reveal_ts)
-    if bot["tier"] == 1 or random.random() < 0.5:
-        x_pct, y_pct = best_xy
-    else:
-        wrong_pts = [(0.25, 0.25), (0.75, 0.25), (0.5, 0.75)]
-        x_pct, y_pct = random.choice(wrong_pts)
-
+    x_pct, y_pct = best_xy if bot["tier"] == 1 or random.random() < 0.5 else (0.25, 0.25)
     page: Page = bot["page"]
     canvas_sel = '[data-functional-selector*="pin-image"], [data-functional-selector*="drop-pin"], canvas, img'
     try:
@@ -358,11 +312,10 @@ async def submit_pin_bot(bot: dict, best_xy: tuple[float, float], reveal_ts: flo
         box = await target.bounding_box()
         if box:
             await page.mouse.click(box["x"] + box["width"] * x_pct, box["y"] + box["height"] * y_pct)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
             await click_submit_if_present(page)
-            print(f"[Pin] {bot['name']} (C{bot['tier']}) -> ({x_pct:.2f}, {y_pct:.2f}) ({time.monotonic() - reveal_ts:.2f}s)")
-    except Exception as e:
-        print(f"[Pin Err] {bot['name']}: {e}")
+    except Exception:
+        pass
 
 
 async def join_kahoot(context, pin: str, bot_info: dict) -> Page | None:
@@ -388,9 +341,14 @@ async def join_kahoot(context, pin: str, bot_info: dict) -> Page | None:
 
 
 async def extract_question_text(lead_page: Page) -> str:
-    q_loc = lead_page.locator('[data-functional-selector="block-title"], [data-functional-selector="question-block-title"]')
-    if await q_loc.count() > 0:
-        return (await q_loc.first.inner_text()).strip()
+    try:
+        q_loc = lead_page.locator('[data-functional-selector="block-title"], [data-functional-selector="question-block-title"], h2')
+        if await q_loc.count() > 0:
+            text = (await q_loc.first.inner_text()).strip()
+            if text:
+                return text
+    except Exception:
+        pass
     return "Select the correct answer:"
 
 
@@ -402,16 +360,21 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         active_bots = []
 
-        # Join bots sequentially with a safe delay to bypass rate-limiting
-        for idx, bot_info in enumerate(roster):
-            if idx > 0:
-                delay = random.uniform(1.0, 1.5)
-                await asyncio.sleep(delay)
+        # Blazing fast parallel bot joins (with small 0.3s stagger to prevent dropouts)
+        async def join_worker(b_info):
+            ctx = await browser.new_context()
+            pg = await join_kahoot(ctx, KAHOOT_PIN, b_info)
+            if pg:
+                return {**b_info, "page": pg, "context": ctx}
+            return None
 
-            context = await browser.new_context()
-            page = await join_kahoot(context, KAHOOT_PIN, bot_info)
-            if page:
-                active_bots.append({**bot_info, "page": page, "context": context})
+        tasks = []
+        for idx, bot_info in enumerate(roster):
+            tasks.append(join_worker(bot_info))
+            await asyncio.sleep(0.3)  # Rapid joining interval
+
+        results = await asyncio.gather(*tasks)
+        active_bots = [b for b in results if b is not None]
 
         if not active_bots:
             print("No bots joined. Exiting.")
@@ -424,7 +387,7 @@ async def main():
         idle_ticks = 0
 
         while idle_ticks < 3600:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)  # Faster polling tick rate (down from 0.3s)
 
             if "ranking" in lead.url or "podium" in lead.url:
                 print("Game finished! Closing bots.")
@@ -439,8 +402,6 @@ async def main():
             if await ans0.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                
-                # Take screenshot so Gemini can see images, graphs, and equations!
                 question_screenshot = await lead.screenshot()
 
                 ms_btn = lead.locator('button[data-functional-selector="multi-select-submit-button"]')
