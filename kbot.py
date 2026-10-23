@@ -201,9 +201,9 @@ async def solve_pin(question: str, image_bytes: bytes = None) -> tuple[float, fl
 
 async def wait_window(tier: int, reveal_timestamp: float):
     if tier == 1:
-        target_delay = random.uniform(0.1, 0.3)  # Ultra-fast reflexes
+        target_delay = random.uniform(0.1, 0.3)
     else:
-        target_delay = random.uniform(1.5, 3.0)  # Slow reference bots
+        target_delay = random.uniform(1.5, 3.0)
     await asyncio.sleep(max(0.0, target_delay - (time.monotonic() - reveal_timestamp)))
 
 
@@ -360,7 +360,7 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         active_bots = []
 
-        # Blazing fast parallel bot joins (with small 0.3s stagger to prevent dropouts)
+        # Safe stagger interval (0.8s) to prevent Kahoot rate-limiting/timeouts
         async def join_worker(b_info):
             ctx = await browser.new_context()
             pg = await join_kahoot(ctx, KAHOOT_PIN, b_info)
@@ -371,7 +371,7 @@ async def main():
         tasks = []
         for idx, bot_info in enumerate(roster):
             tasks.append(join_worker(bot_info))
-            await asyncio.sleep(0.3)  # Rapid joining interval
+            await asyncio.sleep(0.8)  # Safe spacing interval
 
         results = await asyncio.gather(*tasks)
         active_bots = [b for b in results if b is not None]
@@ -387,7 +387,7 @@ async def main():
         idle_ticks = 0
 
         while idle_ticks < 3600:
-            await asyncio.sleep(0.15)  # Faster polling tick rate (down from 0.3s)
+            await asyncio.sleep(0.15)
 
             if "ranking" in lead.url or "podium" in lead.url:
                 print("Game finished! Closing bots.")
