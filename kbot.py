@@ -360,29 +360,32 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         active_bots = []
 
-        # Safe stagger interval (0.8s) to prevent Kahoot rate-limiting/timeouts
-        async def join_worker(b_info):
-            ctx = await browser.new_context()
-            pg = await join_kahoot(ctx, KAHOOT_PIN, b_info)
-            if pg:
-                return {**b_info, "page": pg, "context": ctx}
-            return None
-
-        tasks = []
+        # Join bots sequentially with a safe 1.2s stagger and auto-retry fallback
         for idx, bot_info in enumerate(roster):
-            tasks.append(join_worker(bot_info))
-            await asyncio.sleep(0.8)  # Safe spacing interval
+            if idx > 0:
+                await asyncio.sleep(1.2)  # Safe spacing to bypass rate-limits
 
-        results = await asyncio.gather(*tasks)
-        active_bots = [b for b in results if b is not None]
+            context = await browser.new_context()
+            page = None
+            
+            # Try joining up to 2 times if Kahoot drops the connection
+            for attempt in range(2):
+                page = await join_kahoot(context, KAHOOT_PIN, bot_info)
+                if page:
+                    break
+                print(f"[Retry] Retrying join for {bot_info['name']}...")
+                await asyncio.sleep(1.5)
+
+            if page:
+                active_bots.append({**bot_info, "page": page, "context": context})
 
         if not active_bots:
             print("No bots joined. Exiting.")
             await browser.close()
             return
 
+        print(f"Successfully connected {len(active_bots)}/{len(roster)} bots! Polling for questions...")
         lead = active_bots[0]["page"]
-        print("All bots ready! Polling for questions...")
         last_sig = None
         idle_ticks = 0
 
