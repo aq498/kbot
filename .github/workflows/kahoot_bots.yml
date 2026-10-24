@@ -7,6 +7,11 @@ on:
         description: '1. Kahoot Game PIN'
         required: true
         type: string
+      join_delay:
+        description: 'Delay between bot joins (seconds)'
+        required: false
+        default: '1.2'
+        type: string
       first_class_count:
         description: '2. 1st Class Bot Count (Max 2)'
         required: true
@@ -89,4 +94,5 @@ jobs:
           FIRST_CLASS_NAME_2: ${{ inputs.first_class_name_2 }}
           SECOND_CLASS_COUNT: ${{ inputs.second_class_count }}
           SECOND_CLASS_NAME: ${{ inputs.second_class_name }}
+          JOIN_DELAY: ${{ inputs.join_delay }}
         run: python kbot.py
