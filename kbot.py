@@ -372,7 +372,7 @@ async def main():
         # Safe stagger interval (1.2s) with auto-retry to ensure 100% join rate
         for idx, bot_info in enumerate(roster):
             if idx > 0:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(JOIN_DELAY)
 
             context = await browser.new_context()
             page = None
