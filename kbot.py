@@ -28,6 +28,7 @@ SECOND_CLASS_COUNT = max(int(os.environ.get("SECOND_CLASS_COUNT", "0")), 0)
 SECOND_CLASS_BASE_NAME = os.environ.get("SECOND_CLASS_NAME", "RefBot").strip() or "RefBot"
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
+JOIN_DELAY = float(os.environ.get("JOIN_DELAY", "1.2"))
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable. Set it in GitHub Secrets.")
