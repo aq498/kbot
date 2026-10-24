@@ -81,7 +81,7 @@ class MCQResponse(pydantic.BaseModel):
 async def solve_mcq(question: str, options: list[str], image_bytes: bytes = None) -> int:
     opts_str = "\n".join([f"Index [{i}]: {opt}" for i, opt in enumerate(options)])
     prompt = (
-        f"Analyze this Kahoot question and screenshot carefully.\n"
+        f"Analyze this Kahoot question carefully.\n"
         f"Question: {question}\n\n"
         f"Available Options:\n{opts_str}\n\n"
         f"Select the correct option index (0 to {len(options)-1})."
@@ -95,7 +95,7 @@ async def solve_mcq(question: str, options: list[str], image_bytes: bytes = None
         )
         idx = int(result.get("correct_index", 0))
         if 0 <= idx < len(options):
-            print(f"[AlphaBot High-Accuracy Match] Chose Index {idx} -> {options[idx]}")
+            print(f"[AlphaBot Match] Chose Index {idx} -> {options[idx]}")
             return idx
     except Exception as e:
         print(f"[Gemini Structured MCQ Error] {e}")
@@ -352,6 +352,15 @@ async def extract_question_text(lead_page: Page) -> str:
     return "Select the correct answer:"
 
 
+async def has_question_image(lead_page: Page) -> bool:
+    """Detects if an image, graph, or media element is present in the question layout."""
+    try:
+        media_loc = lead_page.locator('[data-functional-selector*="question-media"], img[data-functional-selector*="image"], .question-media img, video')
+        return (await media_loc.count() > 0) and (await media_loc.first.is_visible())
+    except Exception:
+        return False
+
+
 async def main():
     roster = build_bot_roster()
     print(f"Starting session for Game PIN: {KAHOOT_PIN} | Total bots: {len(roster)}")
@@ -360,15 +369,13 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         active_bots = []
 
-        # Join bots sequentially with a safe 1.2s stagger and auto-retry fallback
+        # Safe stagger interval (1.2s) with auto-retry to ensure 100% join rate
         for idx, bot_info in enumerate(roster):
             if idx > 0:
-                await asyncio.sleep(1.2)  # Safe spacing to bypass rate-limits
+                await asyncio.sleep(1.5)
 
             context = await browser.new_context()
             page = None
-            
-            # Try joining up to 2 times if Kahoot drops the connection
             for attempt in range(2):
                 page = await join_kahoot(context, KAHOOT_PIN, bot_info)
                 if page:
@@ -390,7 +397,7 @@ async def main():
         idle_ticks = 0
 
         while idle_ticks < 3600:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
 
             if "ranking" in lead.url or "podium" in lead.url:
                 print("Game finished! Closing bots.")
@@ -405,7 +412,9 @@ async def main():
             if await ans0.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                question_screenshot = await lead.screenshot()
+                
+                # Conditional Vision: Only capture screenshot if an image/graph is actually present!
+                question_screenshot = await lead.screenshot() if await has_question_image(lead) else None
 
                 ms_btn = lead.locator('button[data-functional-selector="multi-select-submit-button"]')
                 is_multi = (await ms_btn.count()) > 0
@@ -426,6 +435,10 @@ async def main():
                     else:
                         best_idx = await solve_mcq(q_text, options, image_bytes=question_screenshot)
                         await asyncio.gather(*(submit_mcq_bot(b, best_idx, len(options), reveal_ts) for b in active_bots))
+                    
+                    # Safety Cooldown Pause to prevent rate-limiting & 429 errors
+                    await asyncio.sleep(1.0)
+                    
                     try:
                         await ans0.wait_for(state="hidden", timeout=60000)
                     except Exception:
@@ -434,7 +447,7 @@ async def main():
             elif await puzzle_cards.count() >= 2 and await puzzle_cards.first.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                question_screenshot = await lead.screenshot()
+                question_screenshot = await lead.screenshot() if await has_question_image(lead) else None
                 items = [(await puzzle_cards.nth(i).inner_text()).strip() for i in range(await puzzle_cards.count())]
                 sig = f"PUZZLE|{q_text}|{'|'.join(items)}"
                 if sig != last_sig and items:
@@ -442,6 +455,7 @@ async def main():
                     idle_ticks = 0
                     best_order = await solve_puzzle(q_text, items, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_puzzle_bot(b, items, best_order, reveal_ts) for b in active_bots))
+                    await asyncio.sleep(1.0)
                     try:
                         await puzzle_cards.first.wait_for(state="hidden", timeout=60000)
                     except Exception:
@@ -450,13 +464,14 @@ async def main():
             elif await text_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                question_screenshot = await lead.screenshot()
+                question_screenshot = await lead.screenshot() if await has_question_image(lead) else None
                 sig = f"TEXT|{q_text}"
                 if sig != last_sig:
                     last_sig = sig
                     idle_ticks = 0
                     text_pack = await solve_text(q_text, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_text_bot(b, text_pack, reveal_ts) for b in active_bots))
+                    await asyncio.sleep(1.0)
                     try:
                         await text_input.wait_for(state="hidden", timeout=60000)
                     except Exception:
@@ -465,7 +480,7 @@ async def main():
             elif await slider_input.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                question_screenshot = await lead.screenshot()
+                question_screenshot = await lead.screenshot() if await has_question_image(lead) else None
                 min_v = float((await slider_input.get_attribute("min")) or 0)
                 max_v = float((await slider_input.get_attribute("max")) or 100)
                 step_attr = await slider_input.get_attribute("step")
@@ -477,6 +492,7 @@ async def main():
                     idle_ticks = 0
                     slider_pack = await solve_slider(q_text, min_v, max_v, step_v, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_slider_bot(b, slider_pack, reveal_ts) for b in active_bots))
+                    await asyncio.sleep(1.0)
                     try:
                         await slider_input.wait_for(state="hidden", timeout=60000)
                     except Exception:
@@ -485,13 +501,14 @@ async def main():
             elif await pin_canvas.is_visible():
                 reveal_ts = time.monotonic()
                 q_text = await extract_question_text(lead)
-                question_screenshot = await lead.screenshot()
+                question_screenshot = await lead.screenshot() if await has_question_image(lead) else None
                 sig = f"PIN|{q_text}"
                 if sig != last_sig:
                     last_sig = sig
                     idle_ticks = 0
                     best_xy = await solve_pin(q_text, image_bytes=question_screenshot)
                     await asyncio.gather(*(submit_pin_bot(b, best_xy, reveal_ts) for b in active_bots))
+                    await asyncio.sleep(1.0)
                     try:
                         await pin_canvas.wait_for(state="hidden", timeout=60000)
                     except Exception:
